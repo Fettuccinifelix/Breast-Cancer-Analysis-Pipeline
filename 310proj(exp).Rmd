@@ -1,0 +1,588 @@
+---
+title: "310project"
+author: "Nicholas Santoso"
+date: "2023-12-02"
+output: html_document
+---
+## Setup
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(TCGAbiolinks)
+library(survival)
+library(survminer)
+
+library(maftools)
+library(ggplot2)
+library(pheatmap)
+
+library(dplyr)
+library(stringr)
+
+library(purrr)
+
+library(DESeq2)
+library(pheatmap)
+library(ggplot2)
+library("gridExtra")
+library("AnnotationDbi")
+library("org.Hs.eg.db");
+library(gage)
+library(pathview)
+library(gageData)
+
+```
+
+# importing data
+
+```{r data}
+data_mut <- read.delim("data_mutations.txt", header = TRUE, sep = '\t')
+clinical_data <- read.table("data_clinical_patient.txt", header = TRUE, sep = '\t')
+rna_seq <- read.csv("RNAseq_BRCA.csv", row.names = 1)
+```
+
+## finding common patients
+
+```{r }
+#isolating common patient data, finding unique patients
+unique_pat_mut <- data_mut
+unique_pat_mut$Tumor_Sample_Barcode = substr(unique_pat_mut$Tumor_Sample_Barcode,1,
+                                             nchar(unique_pat_mut$Tumor_Sample_Barcode)-3)
+unique_pat_mut <- unique(unique_pat_mut$Tumor_Sample_Barcode)
+unique_pat_clin <- unique(clinical_data$PATIENT_ID)
+#finding common patients between data_clinical_patient and data_mutations
+K <- intersect(unique_pat_clin,unique_pat_mut)
+#editing and pulling out patient ID from RNAseq_BRCA
+unique_rna_data <- colnames(rna_seq)
+unique_rna_data = substr(unique_rna_data,1,nchar(unique_rna_data)-16)
+for (i in 1:length(unique_rna_data)) {
+  unique_rna_data[i] <- chartr('.', '-', unique_rna_data[i])
+}
+
+unique_rna_data <- unique(unique_rna_data)
+
+#array of common patients with clinical, mutation and expression data.
+common_pat <- intersect(K, unique_rna_data)
+
+
+
+
+```
+
+## preprocessing
+```{r}
+common_patient_mut <- subset(data_mut, grepl(paste(common_pat, collapse='|'), data_mut$Tumor_Sample_Barcode))
+
+#keeping high, moderate removing wildtype
+removed <- subset(common_patient_mut, 
+                  (common_patient_mut$IMPACT == "HIGH" | common_patient_mut$IMPACT == "MODERATE" ) & 
+                    common_patient_mut$Variant_Classification != "Silent" & 
+                    common_patient_mut$Variant_Classification != "Missense_Mutation" & 
+                    !(common_patient_mut$Variant_Type == "INS" & (common_patient_mut$Tumor_Seq_Allele1 == "-" &
+                                                                   common_patient_mut$Tumor_Seq_Allele2 == "-")))
+
+common_pat <- substr(removed$Tumor_Sample_Barcode,1,
+                                             nchar(removed$Tumor_Sample_Barcode)-3)
+common_pat <- unique(common_pat)
+```
+
+
+
+## mutation analysis
+```{r}
+
+#mutation consequence (specific) frequency
+mutation.consequence_freq <- as.data.frame(table(removed$Consequence))
+colnames(mutation.consequence_freq)[1] <- "mutation_consequence"
+
+
+#variant classification frequency
+variant_freq <- as.data.frame(table(removed$Variant_Classification))
+colnames(variant_freq)[1] <- "variant_class"
+
+ggplot(data=variant_freq, aes(x=variant_class, y=Freq)) + 
+  geom_col() + theme(axis.text.x = element_text(angle = 45,hjust=1))
+
+
+#impact level frequency
+impact_freq <- as.data.frame(table(removed$IMPACT))
+colnames(impact_freq)[1] <- "impact"
+
+
+#mutation type (general) frequency
+mutation.type_freq <- as.data.frame(table(removed$VARIANT_CLASS))
+colnames(mutation.type_freq)[1] <- "mutation_type"
+
+
+ggplot(data=mutation.type_freq, aes(x=mutation_type, y=Freq))+
+  geom_col(aes(fill=mutation_type))
+
+#variant type frequency
+var.type_freq <- as.data.frame(table(removed$Variant_Type))
+colnames(var.type_freq)[1] <- "variant_type"
+
+ggplot(data=var.type_freq, aes(x=variant_type, y=Freq))+
+  geom_col( aes(fill=variant_type))
+
+#hugo for total
+sample.name <- as.data.frame(table(removed$Tumor_Sample_Barcode))
+hugo <- as.data.frame(table(removed$Hugo_Symbol))
+
+hugo.ordered <- hugo[order(-hugo$Freq),]
+ggplot(data=hugo.ordered[1:25,], aes(x=Var1, y=Freq))+
+  geom_col()+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))+
+  scale_x_discrete(limits = hugo.ordered[1:25,]$Var1)
+
+```
+## oncoplot
+```{r}
+cnv_events = unique(removed$Variant_Classification)
+
+oncomat = reshape2::dcast(
+  data = removed,
+  formula = Hugo_Symbol ~ Tumor_Sample_Barcode,
+  fun.aggregate = function(x, cnv = cnv_events) {
+    x = as.character(x) # >= 2 same/distinct variant classification = Multi_Hit
+    xad = x[x %in% cnv]
+    xvc = x[!x %in% cnv]
+    
+    if (length(xvc) > 0) {
+      xvc = ifelse(test = length(xvc) > 1,
+                   yes = 'Multi_Hit',
+                   no = xvc)
+    }
+    
+    
+    x = ifelse(
+      test = length(xad) > 0,
+      yes = paste(xad, xvc, sep = ';'),
+      no = xvc
+    )
+    x = gsub(pattern = ';$',
+             replacement = '',
+             x = x)
+    x = gsub(pattern = '^;',
+             replacement = '',
+             x = x)
+    return(x)
+  },
+  value.var = 'Variant_Classification',
+  fill = '',
+  drop = FALSE
+)
+rownames(oncomat) = oncomat$Hugo_Symbol
+oncomat <- oncomat[,-1]
+
+oncomat.ordered <- oncomat[order(-hugo$Freq),]
+# Get the number of non-empty string columns for each row
+#num_non_empty_cols <- data.frame(row.names(oncomat), integer(nrow(oncomat)))
+#colnames(num_non_empty_cols) <- c("HUGO", "num_nonzero_col")
+
+
+#num_non_empty_cols[, 2] <- apply(oncomat != "", 1, sum)
+# Order the rows based on the number of non-empty string columns
+#ordered_rows <- num_non_empty_cols[order(-num_non_empty_cols$num_nonzero_col),]
+
+#oncomat.ordered <- oncomat[ordered_rows$HUGO,]
+
+
+
+
+
+
+#transform into binary matrix
+
+mat <- oncomat.ordered
+mat[mat!=""]=1
+mat[mat==""]=0
+mat <- apply(mat, 2 ,as.numeric)
+mat <- as.matrix(mat)
+rownames(mat)  <-  row.names(oncomat.ordered)
+
+# number of genes
+p <- 3
+reduce.mat <- mat[1:p,]
+res <- pheatmap(reduce.mat,
+                cluster_rows = F,
+                show_colnames=FALSE)
+
+#pca_test <- prcomp(t(mat), scale. = TRUE)
+#x <- as.data.frame(pca_test$x)
+#reduced.x <- x[1:p,]
+#res <- pheatmap(reduced.x,
+#                cluster_rows = F,
+#                show_colnames=FALSE, 
+#                clustering_method = "ward.D")
+```
+
+## survival analysis on top 10 hugo
+```{r}
+#edit # of clusters here
+cluster <-  as.data.frame(cutree(res$tree_col, k = 2))
+colnames(cluster)[1] <- 'clusternum'
+cluster$Tumor_Sample_Barcode <- rownames(cluster)
+cluster$Tumor_Sample_Barcode <- substr(cluster$Tumor_Sample_Barcode,1,
+                                             nchar(cluster$Tumor_Sample_Barcode)-3)
+
+#row.names(cluster) <- substr(row.names(cluster), 1, nchar(row.names(cluster)) - 3)
+
+
+# used to be pat_w_top_10_hugo
+clin_patient_w_data <- subset(clinical_data, grepl(paste(common_pat, collapse='|'), clinical_data$PATIENT_ID))
+
+clin_patient_w_data$clusternum <- cluster$clusternum
+#remove patients without PFS
+pat_w_pfs <- subset(clin_patient_w_data, clin_patient_w_data$PFS_STATUS != "")
+#converts to 0,1
+pat_w_pfs$PFS_STATUS <- as.numeric(substr(pat_w_pfs$PFS_STATUS, 1, 1))
+
+#plotting KM plot
+#fit, do not change the OS_months or pfs status. just change the "subtype" part to the name of the column with the mutation data that you added
+
+#pat_w_pfs <- subset(pat_w_pfs, pat_w_pfs$clusternum != 3 & pat_w_pfs$clusternum != 4)
+fit = survfit(Surv(PFS_MONTHS, PFS_STATUS) ~ clusternum, data=pat_w_pfs)
+print(fit)
+
+#plot 
+ggsurvplot(fit, data=pat_w_pfs, pval=T, risk.table=T, risk.table.col="strata",
+           risk.table.height=0.50)
+
+
+#### CONCLUSION:
+# THERE ARE NO DIFFERENCES IN SURVIVAL OUTCOMES IN BETWEEN HUGO #
+```
+###
+```{r}
+clin_patient_in_cluster <- clin_patient_w_data[which(clin_patient_w_data$PATIENT_ID %in% cluster$Tumor_Sample_Barcode),]
+
+clin_patient_in_cluster$clusternum <- cluster$clusternum
+```
+
+```{r}
+#Clusters by subtype 
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=SUBTYPE))+
+  geom_bar()
+
+#Clusters by age 
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=as.factor(AGE)))+
+  geom_bar()
+
+#Clusters by race 
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=RACE))+
+  geom_bar()
+
+#clusters by Radiation therapy/not
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=RADIATION_THERAPY))+
+  geom_bar()
+
+#clusters by sex 
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=SEX))+
+  geom_bar()
+
+#clusters by ethnicity
+ggplot(data=clin_patient_in_cluster, aes(x=clusternum, fill=ETHNICITY))+
+  geom_bar()
+
+cluster <-  as.data.frame(cutree(res$tree_col, k = 2))
+colnames(cluster)[1] <- 'clusternum'
+
+result <- lapply(rownames(cluster), function(x) substr(x, 1, nchar(x) - 3))
+rownames(cluster) <- result
+```
+
+
+
+## Differential analysis
+# preprocessing
+```{r}
+#filters out patients by those with top 10 hugo
+rna_data <- rna_seq 
+colnames(rna_data) <- substr(colnames(rna_data),1,nchar(colnames(rna_data))-16)
+rna_data_colnames <- colnames(rna_data)
+
+for (i in 1:length(rna_data_colnames)) {
+ rna_data_colnames[i] <- chartr('.', '-', rna_data_colnames[i])
+}
+
+colnames(rna_data) <- rna_data_colnames
+
+pat_want <- pat_w_pfs$PATIENT_ID
+
+top_10_hugo_rna <- subset(rna_data, select = pat_want)
+
+
+
+top_10_hugo_rna <- top_10_hugo_rna[rowSums(top_10_hugo_rna)>100,]
+
+
+#colData <- subset(cluster, cluster$clusternum != 1)
+colData <- cluster
+
+countData <- top_10_hugo_rna 
+  
+```
+# tutorial stuff, to be removed if needed
+
+# 4.1 sample distances (data too large)
+#```{r}
+sampleDists = dist(t(countData),upper = TRUE)
+sampleDists
+
+annot_col = data.frame(colData$clusternum)
+row.names(annot_col) <- rownames(colData)
+
+sampleDistMatrix = as.matrix( sampleDists )
+rownames(sampleDistMatrix) = colnames(countData)
+colnames(sampleDistMatrix) = colnames(countData)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=TRUE,
+         annotation_col=annot_col)
+#```
+
+
+#4.2 PCA plot (also too large)
+```{r}
+pca_res <- prcomp(t(countData), scale. = TRUE)
+score <- pca_res$x
+
+score = as.data.frame(score)
+score$color <- as.factor(colData$clusternum)
+
+
+ggplot(score, aes(x=PC1, y=PC2,  color=color)) + 
+  geom_point(size = 4)
+
+p1 <- ggplot(as.data.frame(countData),aes(x=`TCGA-3C-AALI`))+
+  geom_histogram(bins=50)+
+  labs(title="No transformation")
+
+log2 <- log(countData+1, base = 2)
+p2 <- ggplot(as.data.frame(log2),aes(x=`TCGA-3C-AALI`))+
+  geom_histogram(bins=50)+
+  labs(title="Log(x+1)")
+
+grid.arrange(p1, p2, ncol = 2) 
+```
+
+## setting up DEseqDataSet Object and run DESeq pipeline
+
+```{r}
+colData$clusternum <- as.factor(colData$clusternum)
+
+
+dds = DESeqDataSetFromMatrix(countData=countData,
+                              colData=colData,
+                              design=~clusternum)
+
+dds = DESeq(dds)
+#last run at 8:32 am 04/12/23
+dds
+
+```
+## building results table
+```{r}
+resdds <- results(dds, contrast = c("clusternum", 1,2))
+resdds
+#upregulated means upregulated in cluster 1
+```
+
+# summarize results
+```{r}
+summary(resdds)
+
+```
+
+# If we lower the false discovery rate threshold, we should also inform the results() function about it, so that the function can use this threshold for the optimal independent filtering that it performs: (bruh)
+```{r}
+resdds.05 <- results(dds, alpha = 0.05)
+table(resdds.05$padj < 0.05)
+
+resddsLFC1 <- results(dds, lfcThreshold=1)
+table(resddsLFC1$padj < 0.1)
+```
+## P-values and adjusted p values
+```{r}
+resdds <- resdds[order(resdds$pvalue),]
+summary(resdds)
+
+sum(resdds$padj < 0.1, na.rm=TRUE)
+```
+## Multiple testing
+```{r}
+#sum(resdds$pvalue < 0.05, na.rm=TRUE)
+#
+#sum(!is.na(resdds$pvalue))
+
+sum(resdds$padj < 0.06, na.rm=TRUE)
+
+
+resddsSig <- subset(resdds, padj < 0.05)
+#strongest down regulation
+head(resddsSig[ order( resddsSig$log2FoldChange ), ])
+
+#strongest up regulation
+head(resddsSig[ order( resddsSig$log2FoldChange, decreasing=TRUE), ])
+```
+## MA plot
+```{r}
+# leads me to believe that smt wrong :/
+plotMA(resdds, ylim=c(-5,5))
+```
+moving on
+
+#Plot counts
+```{r}
+plotCounts(dds, gene=which.min(resdds$padj), intgroup="clusternum")
+
+```
+
+#effects of transformations on the variance (too long)
+```{r}
+# this gives log2(n + 1)
+ntd <- normTransform(dds)
+# Variance stabilizing transformation
+vsd <- vst(dds)
+
+# Regularized log transformation
+# The blind=TRUE argument results in a transformation unbiased to sample condition information.
+rld <- rlog(dds, blind=FALSE)
+
+sampleDists = dist(t(assay(rld)),upper = TRUE)
+
+annot_col = data.frame(colData$condition)
+row.names(annot_col) <- rownames(colData)
+
+sampleDistMatrix = as.matrix( sampleDists )
+rownames(sampleDistMatrix) = colnames(countData)
+colnames(sampleDistMatrix) = colnames(countData)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=TRUE,
+         annotation_col=annot_col)
+
+pca_res <- prcomp(t(assay(vsd)), scale. = TRUE)
+score <- pca_res$x
+
+score = as.data.frame(score)
+score$color <- as.factor(colData$condition)
+
+
+ggplot(score, aes(x=PC1, y=PC2,  color=color)) + 
+  geom_point(size = 4)
+
+```
+
+
+```{r}
+# we can select a subset of genes to plot.let’s choose the 20 genes with the largest positive log2fold change.
+# genes <- order(res$log2FoldChange,decreasing = TRUE)[1:20]
+
+# or largest negative log2fold change
+# genes <- order(res$log2FoldChange, decreasing = FALSE)[1:20]
+
+# or we can select the top 20 significant genes
+genes <- order(res$padj,decreasing = TRUE)[1:20]
+
+genesdownreg <- order(resddsSig$log2FoldChange, decreasing = FALSE)[1:10]
+genesupreg <- order(resddsSig$log2FoldChange, decreasing = TRUE)[1:10]
+
+genes <- c(genesdownreg,genesupreg)
+
+
+annot_col = data.frame(colData$clusternum)
+row.names(annot_col) <- rownames(colData)
+
+sampleMatrix <- assay(vsd)[genes,]
+
+rownames(sampleMatrix) = rownames(countData[genes,])
+colnames(sampleMatrix) = colnames(countData)
+
+pheatmap(sampleMatrix , cluster_rows=FALSE, show_rownames=TRUE,show_colnames = FALSE,
+         cluster_cols=FALSE, annotation_col=annot_col)
+```
+
+
+## Adding gene annotation
+```{r}
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+new_row_names <- sub("\\..*", "", rownames(resdds))
+rownames(resdds) <- new_row_names
+```
+
+```{r}
+resdds$symbol = mapIds(org.Hs.eg.db,
+                    keys=row.names(resdds), 
+                    column="SYMBOL",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+```
+```{r}
+resdds$entrez = mapIds(org.Hs.eg.db,
+                    keys=row.names(resdds), 
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+```
+```{r}
+resdds$name =   mapIds(org.Hs.eg.db,
+                    keys=row.names(resdds), 
+                    column="GENENAME",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+```
+
+## Pathway analysis
+```{r}
+library(pathview)
+library(gage)
+library(gageData)
+#would be our resdata 
+data(kegg.sets.hs)
+
+
+data(sigmet.idx.hs)
+
+# Focus on signaling and metabolic pathways only
+kegg.sets.hs = kegg.sets.hs[sigmet.idx.hs]
+
+# Examine the first 3 pathways
+#head(kegg.sets.hs, 3)
+
+foldchanges = resdds$log2FoldChange
+names(foldchanges) = resdds$entrez
+head(foldchanges)
+
+# Get the results
+keggres = gage(foldchanges, gsets=kegg.sets.hs)
+
+attributes(keggres)
+
+# Look at the first few down (less) pathways
+head(keggres$less)
+
+head(keggres$greater)
+
+pathview(gene.data=foldchanges, pathway.id="hsa04110")
+
+## Focus on top 5 upregulated pathways here for demo purposes only
+keggrespathways <- rownames(keggres$less)[1:5]
+
+# Extract the 8 character long IDs part of each string
+keggresids = substr(keggrespathways, start=1, stop=8)
+keggresids
+
+# pathview(gene.data=foldchanges, pathway.id=keggresids, species="hsa")
+
+```
+
+
+
+
